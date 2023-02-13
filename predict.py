@@ -45,8 +45,10 @@ class Predictor(BasePredictor):
             cache_dir=MODEL_CACHE,
             local_files_only=True,
         ).to("cuda")
+        self.pipe.enable_xformers_memory_efficient_attention()
 
     @torch.inference_mode()
+    @torch.no_grad()
     @torch.cuda.amp.autocast()
     def predict(
         self,
@@ -64,8 +66,14 @@ class Predictor(BasePredictor):
             choices=[128, 256, 512, 768],
             default=512,
         ),
+        num_interpolation_steps: int = Input(
+            description="Number of steps to interpolate between animation frames",
+            ge=0,
+            le=1000,
+            default=20,
+        ),
         num_inference_steps: int = Input(
-            description="Number of denoising steps", ge=1, le=500, default=50
+            description="Number of denoising steps", ge=1, le=5000, default=50
         ),
         num_animation_frames: int = Input(
             description="Number of frames to animate", default=10, ge=2, le=50
@@ -83,16 +91,24 @@ class Predictor(BasePredictor):
             description="Whether to display intermediate outputs during generation",
             default=False,
         ),
-        seed: int = Input(
-            description="Random seed. Leave blank to randomize the seed", default=None
+        seed_start: int = Input(
+            description="Random seed for first prompt. Leave blank to randomize the seed",
+            default=None,
+        ),
+        seed_end: int = Input(
+            description="Random seed for last prompt. Leave blank to randomize the seed",
+            default=None,
         ),
     ) -> Iterator[Path]:
         """Run a single prediction on the model"""
         with torch.autocast("cuda"), torch.inference_mode():
-            if seed is None:
-                seed = int.from_bytes(os.urandom(2), "big")
-            print(f"Using seed: {seed}")
-            generator = torch.Generator("cuda").manual_seed(seed)
+            if seed_start is None:
+                seed_start = int.from_bytes(os.urandom(2), "big")
+            if seed_end is None:
+                seed_end = int.from_bytes(os.urandom(2), "big")
+            print(f"Using seeds: {seed_start}, {seed_end}")
+            generator_start = torch.Generator("cuda").manual_seed(seed_start)
+            generator_end = torch.Generator("cuda").manual_seed(seed_end)
 
             batch_size = 1
 
@@ -100,9 +116,14 @@ class Predictor(BasePredictor):
             initial_scheduler = self.pipe.scheduler = make_scheduler(
                 num_inference_steps
             )
-            initial_latents = torch.randn(
+            noise_latents_start = torch.randn(
                 (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
-                generator=generator,
+                generator=generator_start,
+                device="cuda",
+            )
+            noise_latents_end = torch.randn(
+                (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
+                generator=generator_end,
                 device="cuda",
             )
             do_classifier_free_guidance = guidance_scale > 1.0
@@ -126,13 +147,13 @@ class Predictor(BasePredictor):
             # re-initialize scheduler
             self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
             latents_start = self.denoise(
-                latents=initial_latents,
+                latents=noise_latents_start,
                 text_embeddings=keyframe_text_embeddings[0],
                 t_start=0,
                 t_end=None,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
-                generator=torch.Generator("cuda").manual_seed(seed),
+                generator=generator_start,
             )
 
             image_start = self.pipe.decode_latents(latents_start)
@@ -143,13 +164,13 @@ class Predictor(BasePredictor):
             # re-initialize scheduler
             self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
             latents_end = self.denoise(
-                latents=initial_latents,
+                latents=noise_latents_end,
                 text_embeddings=keyframe_text_embeddings[-1],
                 t_start=0,
                 t_end=None,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
-                generator=torch.Generator("cuda").manual_seed(seed),
+                generator=generator_end,
             )
             image_end = self.pipe.decode_latents(latents_end)
             self.pipe.run_safety_checker(
@@ -179,31 +200,66 @@ class Predictor(BasePredictor):
                         self.pipe.scheduler = make_scheduler(
                             num_inference_steps, initial_scheduler
                         )
+                        noise_latents = slerp(
+                            i / num_animation_frames,
+                            noise_latents_start,
+                            noise_latents_end,
+                        )
+                        import time
+
+                        t = time.time()
                         latents = self.denoise(
-                            latents=initial_latents,
+                            latents=noise_latents,
                             text_embeddings=text_embeddings,
                             t_start=0,
                             t_end=None,
                             num_inference_steps=num_inference_steps,
                             guidance_scale=guidance_scale,
-                            generator=torch.Generator("cuda").manual_seed(seed),
+                            generator=generator_start,
                         )
+                        print(
+                            f"denoise {time.time() - t=}"
+                        )  # TODO(andreas): remove debug
 
-                        # de-noise this frame
-                        frames_latents.append(latents)
-                        if intermediate_output and i > 0:
-                            image = self.pipe.decode_latents(latents)
-                            yield save_pil_image(
-                                self.pipe.numpy_to_pil(image)[0],
-                                path=f"/tmp/output-{i}.png",
-                            )
+                    # de-noise this frame
+                    frames_latents.append(latents)
+                    if intermediate_output and i > 0:
+                        image = self.pipe.decode_latents(latents)
+                        yield save_pil_image(
+                            self.pipe.numpy_to_pil(image)[0],
+                            path=f"/tmp/output-{i}.png",
+                        )
             frames_latents.append(latents_end)
 
-            images = [
-                self.pipe.decode_latents(lat)[0].astype("float32")
-                for lat in frames_latents
-            ]
+            # for i in frames_latents: yield i
+            # return
+
+            images = self.interpolate_latents(frames_latents, num_interpolation_steps)
+            # for i in images:
+            #    yield i
+            # return
+
+            # images = [
+            #    self.pipe.decode_latents(lat)[0].astype("float32")
+            #    for lat in frames_latents
+            # ]
             yield self.save_mp4(images, frames_per_second, width, height)
+
+    def interpolate_latents(self, frames_latents, num_interpolation_steps):
+        print("Interpolating images from latents")
+        images = []
+        with torch.inference_mode():
+            for i in range(len(frames_latents) - 1):
+                latents_start = frames_latents[i]
+                latents_end = frames_latents[i + 1]
+                for j in range(num_interpolation_steps):
+                    x = j / num_interpolation_steps
+                    latents = latents_start * (1 - x) + latents_end * x
+                    image = self.pipe.decode_latents(latents.to(torch.float16))[
+                        0
+                    ].astype("float32")
+                    images.append(image)
+        return images
 
     def save_mp4(self, images, fps, width, height):
         print("Saving MP4")
@@ -254,11 +310,9 @@ class Predictor(BasePredictor):
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.pipe.prepare_extra_step_kwargs(generator, eta)
 
-        # 7. Denoising loop
-        num_warmup_steps = (
-            len(timesteps) - num_inference_steps * self.pipe.scheduler.order
-        )
-        with self.pipe.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.pipe.progress_bar(
+            total=num_inference_steps
+        ) as progress_bar, torch.inference_mode(), torch.no_grad():
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
