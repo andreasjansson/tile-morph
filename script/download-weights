@@ -1,0 +1,18 @@
+#!/usr/bin/env python
+
+import os
+import sys
+
+import torch
+from diffusers import StableDiffusionInpaintPipeline
+
+os.makedirs("diffusers-cache", exist_ok=True)
+
+
+pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    cache_dir="diffusers-cache",
+    revision="fp16",
+    torch_dtype=torch.float16,
+    use_auth_token=sys.argv[1],
+)
